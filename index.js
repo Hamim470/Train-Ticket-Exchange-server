@@ -1301,16 +1301,16 @@ app.post("/api/tickets/:id/unlock", requireAuth, async (req, res) => {
 
     const unlockFilter = isAdmin
       ? {
-          _id: ticketObjectId,
-          status: "locked",
-          $or: [{ activePaymentId: { $exists: false } }, { activePaymentId: null }],
-        }
+        _id: ticketObjectId,
+        status: "locked",
+        $or: [{ activePaymentId: { $exists: false } }, { activePaymentId: null }],
+      }
       : {
-          _id: ticketObjectId,
-          status: "locked",
-          lockedBy: currentUserId,
-          $or: [{ activePaymentId: { $exists: false } }, { activePaymentId: null }],
-        };
+        _id: ticketObjectId,
+        status: "locked",
+        lockedBy: currentUserId,
+        $or: [{ activePaymentId: { $exists: false } }, { activePaymentId: null }],
+      };
 
     const updated = await ticketsCollection.findOneAndUpdate(
       unlockFilter,
@@ -2077,8 +2077,12 @@ app.post("/api/bookings/:id/dispute", requireAuth, async (req, res) => {
   }
 
   const reason = typeof req.body.reason === "string" ? req.body.reason.trim() : "";
-  if (!reason || reason.length > 2000) {
-    return res.status(400).send({ message: "A dispute reason of 1-2000 characters is required." });
+  const description =
+    typeof req.body.description === "string" ? req.body.description.trim() : "";
+  if (!reason || reason.length > 100 || description.length < 10 || description.length > 2000) {
+    return res.status(400).send({
+      message: "A dispute reason and details of 10-2000 characters are required.",
+    });
   }
 
   const bookingId = new ObjectId(req.params.id);
@@ -2105,6 +2109,7 @@ app.post("/api/bookings/:id/dispute", requireAuth, async (req, res) => {
         buyerId,
         sellerId: booking.sellerId,
         reason,
+        description,
         status: "open",
         createdAt: now,
         updatedAt: now,
@@ -2132,13 +2137,65 @@ app.get(
   requireRole("admin"),
   async (req, res) => {
     try {
-      const filter =
-        req.query.status === "all"
+      const statusFilter = String(req.query.status || "open").toLowerCase();
+      const match =
+        statusFilter === "all"
           ? {}
-          : { status: { $in: ["open", "refund_processing"] } };
+          : statusFilter === "resolved"
+            ? { status: "resolved" }
+            : statusFilter === "open"
+              ? { status: { $in: ["open", "refund_processing"] } }
+              : null;
+      if (!match) {
+        return res.status(400).send({ message: "Invalid dispute status filter." });
+      }
+
       const disputes = await disputesCollection
-        .find(filter)
-        .sort({ createdAt: 1 })
+        .aggregate([
+          { $match: match },
+          { $sort: { createdAt: -1 } },
+          {
+            $lookup: {
+              from: "bookings",
+              localField: "bookingId",
+              foreignField: "_id",
+              as: "booking",
+            },
+          },
+          {
+            $unwind: {
+              path: "$booking",
+              preserveNullAndEmptyArrays: true,
+            },
+          },
+          {
+            $project: {
+              _id: 1,
+              bookingId: 1,
+              buyerId: 1,
+              sellerId: 1,
+              reason: 1,
+              description: 1,
+              amount: 1,
+              fare: 1,
+              status: 1,
+              resolution: 1,
+              adminNote: 1,
+              createdAt: 1,
+              resolvedAt: 1,
+              trainName: "$booking.trainName",
+              trainNumber: "$booking.trainNumber",
+              fromStation: "$booking.fromStation",
+              toStation: "$booking.toStation",
+              journeyDate: "$booking.journeyDate",
+              pnr: "$booking.unlockedDetails.pnr",
+              seatNumber: "$booking.unlockedDetails.seatNumber",
+              coach: "$booking.unlockedDetails.coach",
+              ticketFileUrl: "$booking.unlockedDetails.ticketFileUrl",
+              escrowStatus: "$booking.escrowStatus",
+            },
+          },
+        ])
         .toArray();
       return res.send(disputes);
     } catch (err) {
@@ -2553,6 +2610,636 @@ app.patch(
     });
   }
 );
+
+
+// ==========================================
+// PHASE 5.1: BUYER BOOKINGS & UNMASKED HANDOVER
+// ==========================================
+// ==========================================
+// PHASE 5.1: BUYER BOOKINGS & UNMASKED HANDOVER
+// ==========================================
+
+app.get("/api/bookings/my", requireAuth, async (req, res) => {
+  try {
+    const buyerId = req.user._id.toString();
+
+    const bookings = await bookingsCollection
+      .aggregate([
+        { $match: { buyerId } },
+        { $sort: { createdAt: -1 } },
+        {
+          $addFields: {
+            ticketObjId: {
+              $cond: [
+                { $eq: [{ $type: "$ticketId" }, "objectId"] },
+                "$ticketId",
+                {
+                  $convert: {
+                    input: "$ticketId",
+                    to: "objectId",
+                    onError: null,
+                    onNull: null,
+                  },
+                },
+              ],
+            },
+            sellerObjId: {
+              $cond: [
+                { $eq: [{ $type: "$sellerId" }, "objectId"] },
+                "$sellerId",
+                {
+                  $convert: {
+                    input: "$sellerId",
+                    to: "objectId",
+                    onError: null,
+                    onNull: null,
+                  },
+                },
+              ],
+            },
+          },
+        },
+        {
+          $lookup: {
+            from: "tickets",
+            localField: "ticketObjId",
+            foreignField: "_id",
+            as: "ticketDoc",
+          },
+        },
+        {
+          $unwind: {
+            path: "$ticketDoc",
+            preserveNullAndEmptyArrays: true,
+          },
+        },
+        {
+          $lookup: {
+            from: "users",
+            localField: "sellerObjId",
+            foreignField: "_id",
+            as: "sellerDoc",
+          },
+        },
+        {
+          $unwind: {
+            path: "$sellerDoc",
+            preserveNullAndEmptyArrays: true,
+          },
+        },
+        {
+          $project: {
+            _id: 1,
+            ticketId: 1,
+            paymentId: 1,
+            buyerId: 1,
+            sellerId: 1,
+            tranId: 1,
+            gateway: 1,
+            cardType: 1,
+            fare: 1,
+            platformFee: 1,
+            amount: 1,
+            escrowStatus: 1,
+            bookingStatus: 1,
+            createdAt: 1,
+            confirmedAt: 1,
+            releasedAt: 1,
+            // Joined ticket fields (unmasked exclusively for this buyer)
+            trainName: { $ifNull: ["$ticketDoc.trainName", "$trainName"] },
+            trainNumber: { $ifNull: ["$ticketDoc.trainNumber", "$trainNumber"] },
+            seatClass: { $ifNull: ["$ticketDoc.seatClass", "S_CHAIR"] },
+            fromStation: { $ifNull: ["$ticketDoc.fromStation", "$fromStation"] },
+            toStation: { $ifNull: ["$ticketDoc.toStation", "$toStation"] },
+            journeyDate: { $ifNull: ["$ticketDoc.journeyDate", "$journeyDate"] },
+            departureTime: {
+              $ifNull: ["$ticketDoc.departureTime", "$departureTime"],
+            },
+            coach: {
+              $ifNull: ["$ticketDoc.coach", "$unlockedDetails.coach"],
+            },
+            seatNumber: {
+              $ifNull: ["$ticketDoc.seatNumber", "$unlockedDetails.seatNumber"],
+            },
+            pnr: {
+              $ifNull: ["$ticketDoc.pnr", "$unlockedDetails.pnr"],
+            },
+            ticketFileUrl: {
+              $ifNull: [
+                "$ticketDoc.ticketFileUrl",
+                "$unlockedDetails.ticketFileUrl",
+              ],
+            },
+            // Joined seller contact & verification
+            sellerName: {
+              $ifNull: ["$sellerDoc.name", "$sellerName"],
+            },
+            sellerPhone: {
+              $ifNull: [
+                "$sellerDoc.phone",
+                {
+                  $ifNull: ["$ticketDoc.sellerPhone", "$ticketDoc.phone"],
+                },
+              ],
+            },
+            sellerVerified: {
+              $eq: ["$sellerDoc.kycStatus", "verified"],
+            },
+          },
+        },
+      ])
+      .toArray();
+
+    res.send(bookings);
+  } catch (err) {
+    console.error("Fetch buyer bookings error:", err);
+    res.status(500).send({
+      message: "Failed to load your bookings.",
+    });
+  }
+});
+
+// ==========================================
+// PHASE 5.2: "REACHED SAFELY" & ESCROW RELEASE
+// ==========================================
+app.patch("/api/bookings/:id/confirm-journey", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        message: "Invalid booking ID.",
+      });
+    }
+
+    const bookingObjectId = new ObjectId(id);
+    const buyerId = req.user._id.toString();
+    const now = new Date();
+
+    const existingBooking = await bookingsCollection.findOne({ _id: bookingObjectId });
+    if (!existingBooking) {
+      return res.status(404).send({
+        message: "Booking not found.",
+      });
+    }
+
+    if (existingBooking.buyerId !== buyerId) {
+      return res.status(403).send({
+        message: "Only the buyer of this booking can confirm journey completion.",
+      });
+    }
+
+    if (existingBooking.escrowStatus === "frozen") {
+      return res.status(409).send({
+        message:
+          "Escrow is currently frozen due to an active dispute and cannot be released directly.",
+      });
+    }
+
+    if (existingBooking.escrowStatus === "released") {
+      return res.status(409).send({
+        message: "Escrow funds have already been released to the seller.",
+      });
+    }
+
+    // Atomically transition booking escrowStatus from "held" to "released"
+    const releasedBooking = await bookingsCollection.findOneAndUpdate(
+      {
+        _id: bookingObjectId,
+        buyerId,
+        escrowStatus: "held",
+      },
+      {
+        $set: {
+          escrowStatus: "released",
+          journeyConfirmedAt: now,
+          releasedAt: now,
+          updatedAt: now,
+        },
+      },
+      {
+        returnDocument: "after",
+      }
+    );
+
+    if (!releasedBooking) {
+      return res.status(409).send({
+        message: "Unable to release escrow. Booking state may have changed.",
+      });
+    }
+
+    const sellerPayoutAmount = Number(releasedBooking.fare ?? releasedBooking.amount ?? 0);
+
+    // Credit seller's walletBalance (supports ObjectId or string _id in Better-Auth user collection)
+    const sellerFilter = ObjectId.isValid(releasedBooking.sellerId)
+      ? {
+        $or: [
+          { _id: new ObjectId(releasedBooking.sellerId) },
+          { _id: releasedBooking.sellerId },
+        ],
+      }
+      : { _id: releasedBooking.sellerId };
+
+    await usersCollection.updateOne(sellerFilter, {
+      $inc: { walletBalance: sellerPayoutAmount },
+      $set: { updatedAt: now },
+    });
+
+    await ticketsCollection.updateOne(
+      { _id: new ObjectId(releasedBooking.ticketId) },
+      {
+        $set: {
+          escrowStatus: "released",
+          journeyCompletedAt: now,
+          updatedAt: now,
+        },
+      }
+    );
+
+    res.send({
+      message: `Journey confirmed! ৳${sellerPayoutAmount} released to the seller's wallet.`,
+      booking: releasedBooking,
+      creditedAmount: sellerPayoutAmount,
+    });
+
+  } catch (err) {
+    console.error("Confirm journey / escrow release error:", err);
+    res.status(500).send({
+      message: "Failed to confirm journey and release escrow.",
+    });
+  }
+});
+
+
+
+// ==========================================
+// PHASE 5.3: DISPUTE REPORTING & ADMIN RESOLUTION
+// ==========================================
+// Helper to match Better-Auth user by string or ObjectId _id
+const buildUserIdFilter = (userId) => {
+  if (!userId) return null;
+  if (ObjectId.isValid(userId)) {
+    return {
+      $or: [{ _id: new ObjectId(userId) }, { _id: userId }],
+    };
+  }
+  return { _id: userId };
+}
+
+// 1. POST /api/bookings/:id/dispute — Buyer reports fraud/issue and freezes escrow
+app.post("/api/bookings/:id/dispute", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason, description } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        message: "Invalid booking ID.",
+      });
+    }
+
+    const trimmedReason = String(reason || "").trim();
+    const trimmedDescription = String(description || "").trim();
+
+    if (!trimmedReason || trimmedDescription.length < 10) {
+      return res.status(400).send({
+        message:
+          "Please select a dispute reason and provide at least 10 characters of details.",
+      });
+    }
+
+    const bookingObjectId = new ObjectId(id);
+    const buyerId = req.user._id.toString();
+    const now = new Date();
+
+    const booking = await bookingsCollection.findOne({ _id: bookingObjectId });
+    if (!booking) {
+      return res.status(404).send({
+        message: "Booking not found.",
+      });
+    }
+
+    if (booking.buyerId !== buyerId) {
+      return res.status(403).send({
+        message: "Only the buyer of this booking can report a dispute.",
+      });
+    }
+
+    if (booking.escrowStatus !== "held") {
+      return res.status(409).send({
+        message: `Cannot open a dispute because escrow status is currently '${booking.escrowStatus}'.`,
+      });
+    }
+
+    const frozenBooking = await bookingsCollection.findOneAndUpdate(
+      {
+        _id: bookingObjectId,
+        buyerId,
+        escrowStatus: "held",
+      },
+      {
+        $set: {
+          escrowStatus: "frozen",
+          disputedAt: now,
+          updatedAt: now,
+        },
+      },
+      {
+        returnDocument: "after",
+      }
+    );
+
+    if (!frozenBooking) {
+      return res.status(409).send({
+        message:
+          "Booking escrow could not be frozen. It may have already been released or disputed.",
+      });
+    }
+
+    const disputeDoc = {
+      bookingId: frozenBooking._id,
+      ticketId: frozenBooking.ticketId,
+      buyerId,
+      buyerEmail: req.user.email || frozenBooking.buyerEmail || "",
+      buyerName: req.user.name || "",
+      sellerId: frozenBooking.sellerId,
+      sellerName: frozenBooking.sellerName || "",
+      amount: Number(frozenBooking.amount || 0),
+      fare: Number(frozenBooking.fare ?? frozenBooking.amount ?? 0),
+      reason: trimmedReason,
+      description: trimmedDescription,
+      status: "open",
+      resolution: null,
+      adminNote: "",
+      resolvedBy: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const insertResult = await disputesCollection.insertOne(disputeDoc);
+    const createdDispute = {
+      _id: insertResult.insertedId,
+      ...disputeDoc,
+    };
+
+    await bookingsCollection.updateOne(
+      { _id: frozenBooking._id },
+      {
+        $set: {
+          disputeId: insertResult.insertedId,
+        },
+      }
+    );
+
+    res.status(201).send({
+      message:
+        "Dispute submitted. Escrow funds are now frozen pending admin review.",
+      dispute: createdDispute,
+      booking: {
+        ...frozenBooking,
+        disputeId: insertResult.insertedId,
+      },
+    });
+  } catch (err) {
+    console.error("Create booking dispute error:", err);
+    res.status(500).send({
+      message: "Failed to submit dispute report.",
+    });
+  }
+
+});
+
+// 2. GET /api/admin/disputes — Admin queue of disputes joined with booking & ticket info
+app.get(
+  "/api/admin/disputes",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const statusFilter = String(req.query.status || "all").toLowerCase();
+      const matchStage =
+        statusFilter === "open" || statusFilter === "resolved"
+          ? { status: statusFilter }
+          : {};
+
+      const disputes = await disputesCollection
+        .aggregate([
+          { $match: matchStage },
+          { $sort: { createdAt: -1 } },
+          {
+            $addFields: {
+              bookingObjId: {
+                $cond: [
+                  { $eq: [{ $type: "$bookingId" }, "objectId"] },
+                  "$bookingId",
+                  {
+                    $convert: {
+                      input: "$bookingId",
+                      to: "objectId",
+                      onError: null,
+                      onNull: null,
+                    },
+                  },
+                ],
+              },
+            },
+          },
+          {
+            $lookup: {
+              from: "bookings",
+              localField: "bookingObjId",
+              foreignField: "_id",
+              as: "bookingDoc",
+            },
+          },
+          {
+            $unwind: {
+              path: "$bookingDoc",
+              preserveNullAndEmptyArrays: true,
+            },
+          },
+          {
+            $project: {
+              _id: 1,
+              bookingId: 1,
+              ticketId: 1,
+              buyerId: 1,
+              buyerEmail: 1,
+              buyerName: 1,
+              sellerId: 1,
+              sellerName: 1,
+              amount: 1,
+              fare: 1,
+              reason: 1,
+              description: 1,
+              status: 1,
+              resolution: 1,
+              adminNote: 1,
+              resolvedBy: 1,
+              resolvedAt: 1,
+              createdAt: 1,
+              escrowStatus: "$bookingDoc.escrowStatus",
+              tranId: "$bookingDoc.tranId",
+              trainName: "$bookingDoc.trainName",
+              trainNumber: "$bookingDoc.trainNumber",
+              fromStation: "$bookingDoc.fromStation",
+              toStation: "$bookingDoc.toStation",
+              journeyDate: "$bookingDoc.journeyDate",
+              pnr: "$bookingDoc.unlockedDetails.pnr",
+              seatNumber: "$bookingDoc.unlockedDetails.seatNumber",
+              coach: "$bookingDoc.unlockedDetails.coach",
+              ticketFileUrl: "$bookingDoc.unlockedDetails.ticketFileUrl",
+            },
+          },
+        ])
+        .toArray();
+
+      res.send(disputes);
+    } catch (err) {
+      console.error("Admin fetch disputes error:", err);
+      res.status(500).send({
+        message: "Failed to load disputes queue.",
+      });
+    }
+  });
+
+// 3. PATCH /api/admin/disputes/:id/resolve — Admin refunds buyer or releases payout to seller
+app.patch(
+  "/api/admin/disputes/:id/resolve",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { resolution, adminNote } = req.body;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({
+          message: "Invalid dispute ID.",
+        });
+      }
+
+      if (!["refund_buyer", "release_seller"].includes(resolution)) {
+        return res.status(400).send({
+          message:
+            "Resolution must be either 'refund_buyer' or 'release_seller'.",
+        });
+      }
+
+      const disputeObjectId = new ObjectId(id);
+      const adminId = req.user._id.toString();
+      const now = new Date();
+      const trimmedNote = String(adminNote || "").trim();
+
+      if (!dispute) {
+        return res.status(404).send({
+          message: "Dispute record not found.",
+        });
+      }
+
+      if (dispute.status === "resolved") {
+        return res.status(409).send({
+          message: "This dispute has already been resolved.",
+        });
+      }
+
+      const booking = await bookingsCollection.findOne({
+        _id: new ObjectId(dispute.bookingId),
+      });
+      if (!booking) {
+        return res.status(404).send({
+          message: "Associated booking not found.",
+        });
+      }
+
+      const nextEscrowStatus =
+        resolution === "refund_buyer" ? "refunded" : "released";
+
+      const creditAmount =
+        resolution === "refund_buyer"
+          ? Number(booking.amount ?? dispute.amount ?? 0)
+          : Number(booking.fare ?? booking.amount ?? dispute.fare ?? 0);
+
+      const targetUserId =
+        resolution === "refund_buyer" ? booking.buyerId : booking.sellerId;
+
+      const userFilter = buildUserIdFilter(targetUserId);
+      if (userFilter && creditAmount > 0) {
+        await usersCollection.updateOne(userFilter, {
+          $inc: { walletBalance: creditAmount },
+          $set: { updatedAt: now },
+        });
+      }
+
+      const updatedBooking = await bookingsCollection.findOneAndUpdate(
+        { _id: booking._id },
+        {
+          $set: {
+            escrowStatus: nextEscrowStatus,
+            resolvedAt: now,
+            updatedAt: now,
+          },
+        },
+        { returnDocument: "after" }
+      );
+
+      const updatedDispute = await disputesCollection.findOneAndUpdate(
+        { _id: disputeObjectId, status: "open" },
+        {
+          $set: {
+            status: "resolved",
+            resolution,
+            adminNote: trimmedNote,
+            creditedAmount: creditAmount,
+            resolvedBy: adminId,
+            resolvedAt: now,
+            updatedAt: now,
+          },
+        },
+        { returnDocument: "after" }
+      );
+
+      // Write audit log entry
+      const auditEntry = {
+        action:
+          resolution === "refund_buyer"
+            ? "DISPUTE_REFUND_BUYER"
+            : "DISPUTE_RELEASE_SELLER",
+        targetType: "dispute",
+        targetId: disputeObjectId,
+        bookingId: booking._id,
+        ticketId: booking.ticketId,
+        actorId: adminId,
+        actorEmail: req.user.email || "",
+        resolution,
+        escrowStatus: nextEscrowStatus,
+        creditedAmount: creditAmount,
+        recipientUserId: targetUserId,
+        note: trimmedNote,
+        createdAt: now,
+      };
+
+      await auditLogsCollection.insertOne(auditEntry);
+
+      res.send({
+        message:
+          resolution === "refund_buyer"
+            ? `Dispute resolved: ৳${creditAmount} refunded to buyer's wallet.`
+            : `Dispute resolved: ৳${creditAmount} released to seller's wallet.`,
+        dispute: updatedDispute,
+        booking: updatedBooking,
+      });
+
+    } catch (err) {
+      console.error("Resolve dispute error:", err);
+      res.status(500).send({
+        message: "Failed to resolve dispute.",
+      });
+    }
+  });
+
+
+
 // ==========================================
 // 11. START LOCAL SERVER
 // ==========================================
