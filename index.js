@@ -43,6 +43,9 @@ let disputesCollection;
 let auditLogsCollection;
 let sessionCollection;
 let otpsCollection;
+let paymentsCollection;
+let escrowSettlementsCollection;
+
 
 // Connect to MongoDB
 async function connectToMongoDB() {
@@ -66,6 +69,35 @@ async function connectToMongoDB() {
       auditLogsCollection = database.collection("audit_logs");
       sessionCollection = database.collection("session");
       otpsCollection = database.collection("otps");
+      paymentsCollection = database.collection("payments");
+      escrowSettlementsCollection = database.collection("escrow_settlements");
+
+      await ticketsCollection.createIndex(
+        { pnr: 1 },
+        {
+          unique: true,
+          name: "unique_active_ticket_pnr",
+          partialFilterExpression: {
+            status: { $in: ["pending_approval", "available", "locked", "sold"] },
+          },
+        }
+      );
+      await bookingsCollection.createIndex(
+        { paymentId: 1 },
+        { unique: true, name: "unique_booking_payment" }
+      );
+      await paymentsCollection.createIndex(
+        { tranId: 1 },
+        { unique: true, name: "unique_payment_transaction" }
+      );
+      await disputesCollection.createIndex(
+        { bookingId: 1 },
+        { unique: true, name: "unique_dispute_booking" }
+      );
+      await escrowSettlementsCollection.createIndex(
+        { bookingId: 1 },
+        { unique: true, name: "unique_escrow_settlement_booking" }
+      );
 
       cachedClient = client;
 
@@ -133,6 +165,9 @@ async function sendNotificationEmail({ to, subject, html }) {
 // 4. COMMON MIDDLEWARE
 // ==========================================
 
+// Make sure this middleware is active near the top of index.js so SSLCOMMERZ form POST callbacks parse properly:
+app.use(express.urlencoded({ extended: true }));
+
 // Logger middleware
 const logger = (req, res, next) => {
   console.log("logger logged", req.method, req.url);
@@ -166,7 +201,7 @@ const verifyToken = async (req, res, next) => {
         cookies["__Secure-better-auth.session_token"];
 
       if (rawCookie) {
-        token = rawCookie.split(".")[0];
+        token = rawCookie; // Use full JWT for verification
       }
     }
 
@@ -235,7 +270,7 @@ const requireAuth = async (req, res, next) => {
         cookies["__Secure-better-auth.session_token"];
 
       if (rawCookie) {
-        token = rawCookie.split(".")[0];
+        token = rawCookie; // Use full JWT for verification
       }
     }
 
@@ -843,7 +878,17 @@ app.post("/api/tickets", requireAuth, verifyVerifiedSeller, async (req, res) => 
       updatedAt: now,
     };
 
-    const result = await ticketsCollection.insertOne(newTicket);
+    let result;
+    try {
+      result = await ticketsCollection.insertOne(newTicket);
+    } catch (err) {
+      if (err.code === 11000) {
+        return res.status(409).send({
+          message: "A ticket with this PNR is already listed on the marketplace.",
+        });
+      }
+      throw err;
+    }
 
     // 6. Send confirmation email via Nodemailer
     if (req.user.email) {
@@ -1132,7 +1177,7 @@ app.get("/api/tickets", async (req, res) => {
 // ==========================================
 
 // 1. POST /api/tickets/:id/lock — Atomically acquire a 10-minute checkout lock
-app.post("/api/tickets/:id/lock", requireAuth, async (res, req) => {
+app.post("/api/tickets/:id/lock", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -1144,6 +1189,8 @@ app.post("/api/tickets/:id/lock", requireAuth, async (res, req) => {
 
     const ticketObjectId = new ObjectId(id);
     const currentUserId = req.user._id.toString();
+    const now = new Date();
+    const lockedUntil = new Date(now.getTime() + 10 * 60 * 1000);
 
     const existingTicket = await ticketsCollection.findOne({ _id: ticketObjectId });
     if (!existingTicket) {
@@ -1169,7 +1216,11 @@ app.post("/api/tickets/:id/lock", requireAuth, async (res, req) => {
         _id: ticketObjectId,
         $or: [
           { status: "available" },
-          { status: "locked", lockedUntil: { $lt: now } },
+          {
+            status: "locked",
+            lockedUntil: { $lt: now },
+            $or: [{ activePaymentId: { $exists: false } }, { activePaymentId: null }],
+          },
         ],
       },
       {
@@ -1177,6 +1228,7 @@ app.post("/api/tickets/:id/lock", requireAuth, async (res, req) => {
           status: "locked",
           lockedBy: currentUserId,
           lockedUntil,
+          activePaymentId: null,
           updatedAt: now,
         },
       },
@@ -1205,7 +1257,6 @@ app.post("/api/tickets/:id/lock", requireAuth, async (res, req) => {
       lockedUntil: lockedResult.lockedUntil,
       lockedUntilMs: new Date(lockedResult.lockedUntil).getTime(),
     });
-
   } catch (err) {
     console.error("Atomic ticket lock error:", err);
     res.status(500).send({
@@ -1242,9 +1293,24 @@ app.post("/api/tickets/:id/unlock", requireAuth, async (req, res) => {
       });
     }
 
+    if (existingTicket.activePaymentId) {
+      return res.status(409).send({
+        message: "A payment is in progress for this ticket and it cannot be unlocked.",
+      });
+    }
+
     const unlockFilter = isAdmin
-      ? { _id: ticketObjectId, status: "locked" }
-      : { _id: ticketObjectId, status: "locked", lockedBy: currentUserId };
+      ? {
+          _id: ticketObjectId,
+          status: "locked",
+          $or: [{ activePaymentId: { $exists: false } }, { activePaymentId: null }],
+        }
+      : {
+          _id: ticketObjectId,
+          status: "locked",
+          lockedBy: currentUserId,
+          $or: [{ activePaymentId: { $exists: false } }, { activePaymentId: null }],
+        };
 
     const updated = await ticketsCollection.findOneAndUpdate(
       unlockFilter,
@@ -1285,9 +1351,1208 @@ app.post("/api/tickets/:id/unlock", requireAuth, async (req, res) => {
       message: "Failed to unlock ticket.",
     });
   }
-})
+});
 
 
+// ==========================================
+// PHASE 4.3: SSLCOMMERZ ESCROW PAYMENT FLOW
+// ==========================================
+const SSLCZ_STORE_ID = process.env.SSLCZ_STORE_ID || "coxro6a633b240ed49";
+const SSLCZ_STORE_PASSWD = process.env.SSLCZ_STORE_PASSWD || "";
+const SSLCZ_IS_LIVE = process.env.SSLCZ_IS_LIVE === "true";
+
+const SSLCZ_BASE_URL = SSLCZ_IS_LIVE
+  ? "https://securepay.sslcommerz.com"
+  : "https://sandbox.sslcommerz.com";
+
+const SERVER_BASE_URL = (process.env.SERVER_URL || "http://localhost:5000").replace(/\/$/, "");
+const CLIENT_BASE_URL = (process.env.CLIENT_URL || "http://localhost:3000").replace(/\/$/, "");
+
+const userIdFilter = (id) =>
+  ObjectId.isValid(String(id))
+    ? { $or: [{ _id: new ObjectId(String(id)) }, { _id: String(id) }] }
+    : { _id: id };
+
+const callSslczMerchantApi = async (parameters) => {
+  const apiUrl = new URL(
+    `${SSLCZ_BASE_URL}/validator/api/merchantTransIDvalidationAPI.php`
+  );
+  for (const [key, value] of Object.entries({
+    store_id: SSLCZ_STORE_ID,
+    store_passwd: SSLCZ_STORE_PASSWD,
+    format: "json",
+    v: "1",
+    ...parameters,
+  })) {
+    apiUrl.searchParams.set(key, String(value));
+  }
+
+  const response = await fetch(apiUrl.toString());
+  if (!response.ok) {
+    throw new Error(`SSLCOMMERZ merchant API returned HTTP ${response.status}.`);
+  }
+  return response.json();
+};
+
+const finalizeVerifiedFailedPayment = async (tranId) => {
+  if (typeof tranId !== "string" || tranId.length > 30 || !SSLCZ_STORE_PASSWD) {
+    return false;
+  }
+
+  const gatewayStatus = await callSslczMerchantApi({ tran_id: tranId });
+  const status = String(gatewayStatus.status || "").toUpperCase();
+  if (
+    gatewayStatus.APIConnect !== "DONE" ||
+    gatewayStatus.tran_id !== tranId ||
+    !["FAILED", "CANCELLED"].includes(status) ||
+    (gatewayStatus.store_id && gatewayStatus.store_id !== SSLCZ_STORE_ID)
+  ) {
+    return false;
+  }
+
+  const payment = await paymentsCollection.findOne({
+    tranId,
+    status: { $in: ["initiated", "init_unknown"] },
+  });
+  if (!payment) {
+    return false;
+  }
+
+  const session = client.startSession();
+  try {
+    let updated = false;
+    await session.withTransaction(async () => {
+      const paymentUpdate = await paymentsCollection.updateOne(
+        {
+          _id: payment._id,
+          status: { $in: ["initiated", "init_unknown"] },
+        },
+        {
+          $set: { status: status.toLowerCase(), updatedAt: new Date() },
+        },
+        { session }
+      );
+      if (paymentUpdate.modifiedCount !== 1) {
+        return;
+      }
+
+      await ticketsCollection.updateOne(
+        {
+          _id: payment.ticketId,
+          status: "locked",
+          lockedBy: payment.buyerId,
+          activePaymentId: payment._id,
+        },
+        {
+          $set: {
+            status: "available",
+            lockedBy: null,
+            lockedUntil: null,
+            updatedAt: new Date(),
+          },
+          $unset: { activePaymentId: "" },
+        },
+        { session }
+      );
+      updated = true;
+    });
+    return updated;
+  } finally {
+    await session.endSession();
+  }
+};
+
+const callSslczRefundApi = (parameters) => callSslczMerchantApi(parameters);
+
+const verifyAndFinalizeSslczPayment = async (valId, tranId) => {
+  const payment = await paymentsCollection.findOne({ tranId });
+  if (!payment) {
+    return { ok: false, status: 404, message: "Payment record not found." };
+  }
+
+  // Idempotent check if IPN and success_url arrive back-to-back
+  if (payment.status === "completed" && payment.bookingId) {
+    const existingBooking = await bookingsCollection.findOne({
+      _id: new ObjectId(payment.bookingId),
+    });
+    const soldTicket = await ticketsCollection.findOne({
+      _id: payment.ticketId,
+    });
+    return {
+      ok: true,
+      alreadyConfirmed: true,
+      booking: existingBooking,
+      ticket: soldTicket,
+    };
+  }
+
+  if (!["initiated", "init_unknown"].includes(payment.status)) {
+    return {
+      ok: false,
+      status: 409,
+      message: `Payment cannot be finalized from status "${payment.status}".`,
+    };
+  }
+
+  if (!valId) {
+    return { ok: false, status: 400, message: "Missing val_id from SSLCOMMERZ." };
+  }
+
+  const validationUrl = new URL(
+    `${SSLCZ_BASE_URL}/validator/api/validationserverAPI.php`
+  );
+  validationUrl.searchParams.set("val_id", valId);
+  validationUrl.searchParams.set("store_id", SSLCZ_STORE_ID);
+  validationUrl.searchParams.set("store_passwd", SSLCZ_STORE_PASSWD);
+  validationUrl.searchParams.set("v", "1");
+  validationUrl.searchParams.set("format", "json");
+
+  const verifyResponse = await fetch(validationUrl.toString());
+  if (!verifyResponse.ok) {
+    throw new Error(`SSLCOMMERZ validation returned HTTP ${verifyResponse.status}.`);
+  }
+  const verifyData = await verifyResponse.json();
+
+  const validStatuses = ["VALID", "VALIDATED"];
+  const paidAmount = Number(verifyData.amount);
+  const expectedAmount = Number(payment.amount);
+
+  if (
+    !validStatuses.includes(String(verifyData.status || "").toUpperCase()) ||
+    verifyData.tran_id !== tranId ||
+    (verifyData.store_id && verifyData.store_id !== SSLCZ_STORE_ID) ||
+    !Number.isFinite(paidAmount) ||
+    !Number.isFinite(expectedAmount) ||
+    Math.round(paidAmount * 100) !== Math.round(expectedAmount * 100) ||
+    String(verifyData.currency || "").toUpperCase() !== "BDT"
+  ) {
+    return {
+      ok: false,
+      status: 400,
+      message: "SSLCOMMERZ payment validation failed or amount mismatched.",
+    };
+  }
+
+  const now = new Date();
+  const bookingId = new ObjectId();
+  const session = client.startSession();
+  let finalization;
+
+  try {
+    await session.withTransaction(async () => {
+      const currentPayment = await paymentsCollection.findOne(
+        { _id: payment._id },
+        { session }
+      );
+      if (currentPayment?.status === "completed" && currentPayment.bookingId) {
+        const existingBooking = await bookingsCollection.findOne(
+          { _id: currentPayment.bookingId },
+          { session }
+        );
+        const existingTicket = await ticketsCollection.findOne(
+          { _id: currentPayment.ticketId },
+          { session }
+        );
+        finalization = {
+          ok: true,
+          alreadyConfirmed: true,
+          booking: existingBooking,
+          ticket: existingTicket,
+        };
+        return;
+      }
+
+      if (!["initiated", "init_unknown"].includes(currentPayment?.status)) {
+        throw Object.assign(new Error("Payment is no longer active."), {
+          code: "PAYMENT_NOT_ACTIVE",
+        });
+      }
+
+      const soldTicket = await ticketsCollection.findOneAndUpdate(
+        {
+          _id: payment.ticketId,
+          status: "locked",
+          lockedBy: payment.buyerId,
+          activePaymentId: payment._id,
+        },
+        {
+          $set: {
+            status: "sold",
+            soldTo: payment.buyerId,
+            soldAt: now,
+            bookingId,
+            lockedBy: null,
+            lockedUntil: null,
+            updatedAt: now,
+          },
+          $unset: { activePaymentId: "" },
+        },
+        { returnDocument: "after", session }
+      );
+
+      if (!soldTicket) {
+        throw Object.assign(new Error("The ticket payment lock is unavailable."), {
+          code: "TICKET_LOCK_UNAVAILABLE",
+        });
+      }
+
+      const bookingDoc = {
+        _id: bookingId,
+        ticketId: soldTicket._id,
+        paymentId: payment._id,
+        buyerId: payment.buyerId,
+        buyerEmail: payment.buyerEmail,
+        sellerId: soldTicket.sellerId,
+        sellerName: soldTicket.sellerName || "",
+        gateway: "sslcommerz",
+        cardType: verifyData.card_type || verifyData.card_brand || "SSLCOMMERZ",
+        tranId: payment.tranId,
+        valId,
+        bankTranId: verifyData.bank_tran_id || "",
+        fare: payment.fare,
+        platformFee: payment.platformFee,
+        amount: payment.amount,
+        storeAmount: Number(verifyData.store_amount || payment.amount),
+        escrowStatus: "held",
+        bookingStatus: "confirmed",
+        journeyDate: soldTicket.journeyDate,
+        departureTime: soldTicket.departureTime,
+        trainName: soldTicket.trainName,
+        trainNumber: soldTicket.trainNumber,
+        fromStation: soldTicket.fromStation,
+        toStation: soldTicket.toStation,
+        unlockedDetails: {
+          coach: soldTicket.coach,
+          seatNumber: soldTicket.seatNumber,
+          pnr: soldTicket.pnr,
+          ticketFileUrl: soldTicket.ticketFileUrl,
+        },
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      await bookingsCollection.insertOne(bookingDoc, { session });
+
+      const paymentUpdate = await paymentsCollection.updateOne(
+        { _id: payment._id, status: { $in: ["initiated", "init_unknown"] } },
+        {
+          $set: {
+            status: "completed",
+            valId,
+            bankTranId: verifyData.bank_tran_id || "",
+            cardType: verifyData.card_type || "",
+            bookingId,
+            validationResponse: verifyData,
+            confirmedAt: now,
+            updatedAt: now,
+          },
+        },
+        { session }
+      );
+
+      if (paymentUpdate.modifiedCount !== 1) {
+        throw Object.assign(new Error("Payment state changed during finalization."), {
+          code: "PAYMENT_NOT_ACTIVE",
+        });
+      }
+
+      finalization = {
+        ok: true,
+        booking: bookingDoc,
+        ticket: soldTicket,
+      };
+    });
+  } catch (err) {
+    if (err.code === "TICKET_LOCK_UNAVAILABLE") {
+      await paymentsCollection.updateOne(
+        { _id: payment._id, status: { $in: ["initiated", "init_unknown"] } },
+        {
+          $set: {
+            status: "refund_required",
+            valId,
+            bankTranId: verifyData.bank_tran_id || "",
+            validationResponse: verifyData,
+            updatedAt: new Date(),
+          },
+        }
+      );
+      return {
+        ok: false,
+        status: 409,
+        message: "Payment was received but the ticket lock is unavailable; a refund is required.",
+      };
+    }
+    if (err.code === "PAYMENT_NOT_ACTIVE") {
+      const updatedPayment = await paymentsCollection.findOne({ _id: payment._id });
+      if (updatedPayment?.status === "completed" && updatedPayment.bookingId) {
+        return {
+          ok: true,
+          alreadyConfirmed: true,
+          booking: await bookingsCollection.findOne({ _id: updatedPayment.bookingId }),
+          ticket: await ticketsCollection.findOne({ _id: updatedPayment.ticketId }),
+        };
+      }
+      return { ok: false, status: 409, message: err.message };
+    }
+    throw err;
+  } finally {
+    await session.endSession();
+  }
+
+  return finalization;
+};
+
+// 1. POST /api/payments/initiate — Create SSLCOMMERZ checkout session
+app.post("/api/payments/initiate", requireAuth, async (req, res) => {
+  try {
+    const { ticketId } = req.body;
+
+    if (!ticketId || !ObjectId.isValid(ticketId)) {
+      return res.status(400).send({ message: "Valid ticketId is required." });
+    }
+
+    if (!SSLCZ_STORE_PASSWD) {
+      return res.status(500).send({
+        message: "SSLCZ_STORE_PASSWD is not configured on the server.",
+      });
+    }
+
+    const ticketObjectId = new ObjectId(ticketId);
+    const buyerId = req.user._id.toString();
+    const ticket = await ticketsCollection.findOne({ _id: ticketObjectId });
+
+    if (!ticket) {
+      return res.status(404).send({ message: "Ticket listing not found." });
+    }
+
+    if (ticket.sellerId === buyerId) {
+      return res.status(400).send({
+        message: "You cannot purchase your own ticket listing.",
+      });
+    }
+
+    const now = new Date();
+    const lockExpiresAt = ticket.lockedUntil ? new Date(ticket.lockedUntil) : null;
+
+    if (
+      ticket.status !== "locked" ||
+      ticket.lockedBy !== buyerId ||
+      !lockExpiresAt ||
+      lockExpiresAt <= now
+    ) {
+      return res.status(409).send({
+        message:
+          "Your 10-minute checkout lock is missing or has expired. Please lock the ticket again.",
+      });
+    }
+
+    const fare = Number(ticket.fare || 0);
+    const platformFee = Number(ticket.platformFee ?? 25);
+    const totalAmount = fare + platformFee;
+    const paymentId = new ObjectId();
+    const tranId = `TTE_${paymentId.toString()}`;
+
+    const paymentDoc = {
+      _id: paymentId,
+      ticketId: ticket._id,
+      buyerId,
+      buyerEmail: req.user.email || "buyer@trainticketexchange.bd",
+      buyerName: req.user.name || "Verified Buyer",
+      sellerId: ticket.sellerId,
+      gateway: "sslcommerz",
+      tranId,
+      fare,
+      platformFee,
+      amount: totalAmount,
+      currency: "BDT",
+      status: "initiated",
+      lockedUntil: lockExpiresAt,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const paymentSession = client.startSession();
+    try {
+      await paymentSession.withTransaction(async () => {
+        const lockUpdate = await ticketsCollection.updateOne(
+          {
+            _id: ticket._id,
+            status: "locked",
+            lockedBy: buyerId,
+            lockedUntil: { $gt: now },
+            $or: [
+              { activePaymentId: { $exists: false } },
+              { activePaymentId: null },
+            ],
+          },
+          { $set: { activePaymentId: paymentDoc._id, updatedAt: now } },
+          { session: paymentSession }
+        );
+
+        if (lockUpdate.modifiedCount !== 1) {
+          throw Object.assign(new Error("A payment is already active for this ticket."), {
+            code: "ACTIVE_PAYMENT_EXISTS",
+          });
+        }
+
+        await paymentsCollection.insertOne(paymentDoc, { session: paymentSession });
+      });
+    } catch (err) {
+      if (err.code === "ACTIVE_PAYMENT_EXISTS") {
+        return res.status(409).send({
+          message: "A payment is already active for this ticket.",
+        });
+      }
+      throw err;
+    } finally {
+      await paymentSession.endSession();
+    }
+
+    const sslPayload = new URLSearchParams({
+      store_id: SSLCZ_STORE_ID,
+      store_passwd: SSLCZ_STORE_PASSWD,
+      total_amount: String(totalAmount),
+      currency: "BDT",
+      tran_id: tranId,
+      success_url: `${SERVER_BASE_URL}/api/payments/sslcommerz/success`,
+      fail_url: `${SERVER_BASE_URL}/api/payments/sslcommerz/fail`,
+      cancel_url: `${SERVER_BASE_URL}/api/payments/sslcommerz/cancel`,
+      ipn_url: `${SERVER_BASE_URL}/api/payments/confirm`,
+      shipping_method: "NO",
+      product_name: `${ticket.trainName} (${ticket.fromStation} to ${ticket.toStation})`,
+      product_category: "Train Ticket Escrow",
+      product_profile: "non-physical-goods",
+      cus_name: req.user.name || "TTE Buyer",
+      cus_email: req.user.email || "buyer@trainticketexchange.bd",
+      cus_add1: "Bangladesh",
+      cus_city: "Dhaka",
+      cus_country: "Bangladesh",
+      cus_phone: req.user.phone || "01700000000",
+      value_a: ticket._id.toString(),
+      value_b: buyerId,
+    });
+
+    let sslData;
+    try {
+      const sslResponse = await fetch(`${SSLCZ_BASE_URL}/gwprocess/v4/api.php`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: sslPayload.toString(),
+      });
+      if (!sslResponse.ok) {
+        throw new Error(`SSLCOMMERZ session API returned HTTP ${sslResponse.status}.`);
+      }
+      sslData = await sslResponse.json();
+    } catch (err) {
+      await paymentsCollection.updateOne(
+        { _id: paymentDoc._id, status: "initiated" },
+        { $set: { status: "init_unknown", updatedAt: new Date() } }
+      );
+      throw err;
+    }
+
+    if (sslData.status !== "SUCCESS" || !sslData.GatewayPageURL) {
+      await paymentsCollection.updateOne(
+        { _id: paymentDoc._id },
+        {
+          $set: {
+            status: "init_failed",
+            gatewayError: sslData.failedreason || "Failed to create SSLCOMMERZ session",
+            updatedAt: new Date(),
+          },
+        }
+      );
+      await ticketsCollection.updateOne(
+        { _id: ticket._id, activePaymentId: paymentDoc._id },
+        { $unset: { activePaymentId: "" }, $set: { updatedAt: new Date() } }
+      );
+
+      return res.status(502).send({
+        message:
+          sslData.failedreason || "SSLCOMMERZ session initiation failed.",
+      });
+    }
+
+    await paymentsCollection.updateOne(
+      { _id: paymentDoc._id },
+      {
+        $set: {
+          sessionKey: sslData.sessionkey || "",
+          gatewayPageUrl: sslData.GatewayPageURL,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    res.status(201).send({
+      message: "SSLCOMMERZ checkout session created.",
+      paymentId: paymentDoc._id.toString(),
+      tranId,
+      sessionKey: sslData.sessionkey,
+      gatewayPageUrl: sslData.GatewayPageURL,
+      amount: totalAmount,
+    });
+
+  } catch (err) {
+    console.error("SSLCOMMERZ initiate error:", err);
+    res.status(500).send({
+      message: "Failed to initiate SSLCOMMERZ payment.",
+    });
+  }
+});
+
+// SSLCOMMERZ callback routes must exist before any payment-initiation request.
+app.post("/api/payments/confirm", async (req, res) => {
+  try {
+    const valId = req.body.val_id || req.body.valId;
+    const tranId = req.body.tran_id || req.body.tranId;
+    const ipnStatus = String(req.body.status || "").toUpperCase();
+
+    if (typeof tranId !== "string" || tranId.length > 30) {
+      return res.status(400).send({ message: "Invalid or missing tran_id in IPN payload." });
+    }
+
+    if (["FAILED", "CANCELLED"].includes(ipnStatus)) {
+      const updated = await finalizeVerifiedFailedPayment(tranId);
+      return res.status(updated ? 200 : 202).send({
+        message: updated
+          ? `Payment marked as ${ipnStatus.toLowerCase()}.`
+          : "Failure notification is not verified; no payment state was changed.",
+      });
+    }
+
+    const result = await verifyAndFinalizeSslczPayment(valId, tranId);
+    if (!result.ok) {
+      return res.status(result.status || 400).send({ message: result.message });
+    }
+
+    return res.send({ message: "Payment validated via SSLCOMMERZ and escrow activated." });
+  } catch (err) {
+    console.error("SSLCOMMERZ IPN confirm error:", err);
+    return res.status(500).send({ message: "Failed to process SSLCOMMERZ confirmation." });
+  }
+});
+
+app.post("/api/payments/sslcommerz/success", async (req, res) => {
+  try {
+    const valId = req.body.val_id;
+    const tranId = req.body.tran_id;
+    const ticketId = req.body.value_a || "";
+    if (typeof valId !== "string" || typeof tranId !== "string" || tranId.length > 30) {
+      return res.redirect(`${CLIENT_BASE_URL}/tickets?payment=error`);
+    }
+    const result = await verifyAndFinalizeSslczPayment(valId, tranId);
+
+    if (!result.ok) {
+      return res.redirect(
+        `${CLIENT_BASE_URL}/checkout/${ticketId}?payment=failed&reason=${encodeURIComponent(result.message)}`
+      );
+    }
+
+    return res.redirect(
+      `${CLIENT_BASE_URL}/checkout/${ticketId}?payment=success&tranId=${encodeURIComponent(tranId)}`
+    );
+  } catch (err) {
+    console.error("SSLCOMMERZ success redirect error:", err);
+    return res.redirect(`${CLIENT_BASE_URL}/tickets?payment=error`);
+  }
+});
+
+app.post("/api/payments/sslcommerz/fail", async (req, res) => {
+  const tranId = req.body.tran_id;
+  const ticketId = req.body.value_a || "";
+  if (typeof tranId === "string") {
+    try {
+      await finalizeVerifiedFailedPayment(tranId);
+    } catch (err) {
+      console.error("SSLCOMMERZ failure callback verification error:", err);
+    }
+  }
+  return res.redirect(`${CLIENT_BASE_URL}/checkout/${ticketId}?payment=failed`);
+});
+
+app.post("/api/payments/sslcommerz/cancel", async (req, res) => {
+  const tranId = req.body.tran_id;
+  const ticketId = req.body.value_a || "";
+  if (typeof tranId === "string") {
+    try {
+      await finalizeVerifiedFailedPayment(tranId);
+    } catch (err) {
+      console.error("SSLCOMMERZ cancellation callback verification error:", err);
+    }
+  }
+  return res.redirect(`${CLIENT_BASE_URL}/checkout/${ticketId}?payment=cancelled`);
+});
+
+app.get("/api/payments/status/:tranId", requireAuth, async (req, res) => {
+  try {
+    const buyerId = req.user._id.toString();
+    const payment = await paymentsCollection.findOne({ tranId: req.params.tranId, buyerId });
+    if (!payment) {
+      return res.status(404).send({ message: "Payment record not found." });
+    }
+
+    if (payment.status !== "completed" || !payment.bookingId) {
+      return res.send({ status: payment.status, booking: null });
+    }
+
+    const booking = await bookingsCollection.findOne({
+      _id: payment.bookingId,
+      buyerId,
+    });
+    return res.send({ status: "completed", booking });
+  } catch (err) {
+    console.error("Payment status fetch error:", err);
+    return res.status(500).send({ message: "Failed to fetch payment status." });
+  }
+});
+
+app.patch("/api/bookings/:id/confirm-journey", requireAuth, async (req, res) => {
+  if (!ObjectId.isValid(req.params.id)) {
+    return res.status(400).send({ message: "Invalid booking ID." });
+  }
+
+  const bookingId = new ObjectId(req.params.id);
+  const buyerId = req.user._id.toString();
+  const now = new Date();
+  const session = client.startSession();
+
+  try {
+    let releasedBooking;
+    await session.withTransaction(async () => {
+      releasedBooking = await bookingsCollection.findOneAndUpdate(
+        { _id: bookingId, buyerId, escrowStatus: "held" },
+        { $set: { escrowStatus: "released", releasedAt: now, updatedAt: now } },
+        { returnDocument: "after", session }
+      );
+
+      if (!releasedBooking) {
+        throw Object.assign(new Error("Booking is not eligible for release."), {
+          code: "ESCROW_NOT_HELD",
+        });
+      }
+
+      const sellerUpdate = await usersCollection.updateOne(
+        userIdFilter(releasedBooking.sellerId),
+        { $inc: { walletBalance: Number(releasedBooking.fare) } },
+        { session }
+      );
+      if (sellerUpdate.matchedCount !== 1) {
+        throw new Error("Booking seller account was not found.");
+      }
+
+      await escrowSettlementsCollection.insertOne(
+        {
+          bookingId,
+          action: "release",
+          status: "completed",
+          amount: Number(releasedBooking.fare),
+          completedAt: now,
+          createdAt: now,
+          updatedAt: now,
+        },
+        { session }
+      );
+    });
+
+    return res.send({ message: "Escrow released to the seller wallet.", booking: releasedBooking });
+  } catch (err) {
+    if (err.code === "ESCROW_NOT_HELD") {
+      const booking = await bookingsCollection.findOne({ _id: bookingId, buyerId });
+      if (booking?.escrowStatus === "released") {
+        return res.send({ message: "Escrow was already released.", booking });
+      }
+      return res.status(409).send({ message: "Booking is not eligible for release." });
+    }
+    console.error("Journey confirmation error:", err);
+    return res.status(500).send({ message: "Failed to release escrow." });
+  } finally {
+    await session.endSession();
+  }
+});
+
+app.post("/api/bookings/:id/dispute", requireAuth, async (req, res) => {
+  if (!ObjectId.isValid(req.params.id)) {
+    return res.status(400).send({ message: "Invalid booking ID." });
+  }
+
+  const reason = typeof req.body.reason === "string" ? req.body.reason.trim() : "";
+  if (!reason || reason.length > 2000) {
+    return res.status(400).send({ message: "A dispute reason of 1-2000 characters is required." });
+  }
+
+  const bookingId = new ObjectId(req.params.id);
+  const buyerId = req.user._id.toString();
+  const now = new Date();
+  const session = client.startSession();
+
+  try {
+    let dispute;
+    await session.withTransaction(async () => {
+      const booking = await bookingsCollection.findOneAndUpdate(
+        { _id: bookingId, buyerId, escrowStatus: "held" },
+        { $set: { escrowStatus: "frozen", updatedAt: now } },
+        { returnDocument: "after", session }
+      );
+      if (!booking) {
+        throw Object.assign(new Error("Booking is not eligible for a dispute."), {
+          code: "ESCROW_NOT_HELD",
+        });
+      }
+
+      dispute = {
+        bookingId,
+        buyerId,
+        sellerId: booking.sellerId,
+        reason,
+        status: "open",
+        createdAt: now,
+        updatedAt: now,
+      };
+      await disputesCollection.insertOne(dispute, { session });
+    });
+
+    return res.status(201).send({ message: "Dispute opened; escrow is frozen.", dispute });
+  } catch (err) {
+    if (err.code === "ESCROW_NOT_HELD" || err.code === 11000) {
+      return res.status(409).send({
+        message: "Booking is not eligible for a new dispute.",
+      });
+    }
+    console.error("Booking dispute error:", err);
+    return res.status(500).send({ message: "Failed to open dispute." });
+  } finally {
+    await session.endSession();
+  }
+});
+
+app.get(
+  "/api/admin/disputes",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const filter =
+        req.query.status === "all"
+          ? {}
+          : { status: { $in: ["open", "refund_processing"] } };
+      const disputes = await disputesCollection
+        .find(filter)
+        .sort({ createdAt: 1 })
+        .toArray();
+      return res.send(disputes);
+    } catch (err) {
+      console.error("Fetch admin disputes error:", err);
+      return res.status(500).send({ message: "Failed to fetch disputes." });
+    }
+  }
+);
+
+app.patch(
+  "/api/admin/disputes/:id/resolve",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ message: "Invalid dispute ID." });
+    }
+
+    const action = req.body.action;
+    if (!["release", "refund"].includes(action)) {
+      return res.status(400).send({ message: "Action must be 'release' or 'refund'." });
+    }
+
+    const disputeId = new ObjectId(req.params.id);
+    const now = new Date();
+
+    if (action === "release") {
+      const session = client.startSession();
+      try {
+        let booking;
+        await session.withTransaction(async () => {
+          const dispute = await disputesCollection.findOne(
+            { _id: disputeId, status: "open" },
+            { session }
+          );
+          if (!dispute) {
+            throw Object.assign(new Error("Dispute is not open."), { code: "DISPUTE_NOT_OPEN" });
+          }
+
+          booking = await bookingsCollection.findOneAndUpdate(
+            { _id: dispute.bookingId, escrowStatus: "frozen" },
+            { $set: { escrowStatus: "released", releasedAt: now, updatedAt: now } },
+            { returnDocument: "after", session }
+          );
+          if (!booking) {
+            throw Object.assign(new Error("Escrow is not frozen."), { code: "ESCROW_NOT_FROZEN" });
+          }
+
+          const sellerUpdate = await usersCollection.updateOne(
+            userIdFilter(booking.sellerId),
+            { $inc: { walletBalance: Number(booking.fare) } },
+            { session }
+          );
+          if (sellerUpdate.matchedCount !== 1) {
+            throw new Error("Booking seller account was not found.");
+          }
+
+          const disputeUpdate = await disputesCollection.updateOne(
+            { _id: disputeId, status: "open" },
+            { $set: { status: "resolved", resolution: "release", resolvedAt: now, updatedAt: now } },
+            { session }
+          );
+          if (disputeUpdate.modifiedCount !== 1) {
+            throw Object.assign(new Error("Dispute state changed during resolution."), {
+              code: "DISPUTE_NOT_OPEN",
+            });
+          }
+          const previousSettlement = await escrowSettlementsCollection.findOne(
+            { bookingId: booking._id },
+            { session }
+          );
+          if (previousSettlement) {
+            if (
+              previousSettlement.action !== "refund" ||
+              !["cancelled", "failed"].includes(previousSettlement.status)
+            ) {
+              throw Object.assign(new Error("A different settlement is already in progress."), {
+                code: "SETTLEMENT_IN_PROGRESS",
+              });
+            }
+            const settlementUpdate = await escrowSettlementsCollection.updateOne(
+              { _id: previousSettlement._id, status: previousSettlement.status },
+              {
+                $set: {
+                  action: "release",
+                  status: "completed",
+                  amount: Number(booking.fare),
+                  completedAt: now,
+                  updatedAt: now,
+                },
+              },
+              { session }
+            );
+            if (settlementUpdate.modifiedCount !== 1) {
+              throw Object.assign(new Error("Settlement state changed during resolution."), {
+                code: "SETTLEMENT_IN_PROGRESS",
+              });
+            }
+          } else {
+            await escrowSettlementsCollection.insertOne(
+              {
+                bookingId: booking._id,
+                disputeId,
+                action: "release",
+                status: "completed",
+                amount: Number(booking.fare),
+                completedAt: now,
+                createdAt: now,
+                updatedAt: now,
+              },
+              { session }
+            );
+          }
+          await auditLogsCollection.insertOne(
+            {
+              action: "ESCROW_RELEASED",
+              adminId: req.user._id,
+              adminEmail: req.user.email,
+              targetBookingId: booking._id,
+              targetDisputeId: disputeId,
+              details: { settlement: "seller_wallet", amount: Number(booking.fare) },
+              createdAt: now,
+            },
+            { session }
+          );
+        });
+        return res.send({ message: "Dispute resolved; escrow released to seller wallet.", booking });
+      } catch (err) {
+        if (["DISPUTE_NOT_OPEN", "ESCROW_NOT_FROZEN", "SETTLEMENT_IN_PROGRESS"].includes(err.code)) {
+          return res.status(409).send({ message: err.message });
+        }
+        console.error("Dispute release error:", err);
+        return res.status(500).send({ message: "Failed to release disputed escrow." });
+      } finally {
+        await session.endSession();
+      }
+    }
+
+    const dispute = await disputesCollection.findOne({ _id: disputeId });
+    if (!dispute) {
+      return res.status(404).send({ message: "Dispute not found." });
+    }
+
+    let booking = await bookingsCollection.findOne({
+      _id: dispute.bookingId,
+      escrowStatus: { $in: ["frozen", "refund_processing"] },
+    });
+    if (!booking) {
+      return res.status(409).send({ message: "Dispute escrow is not available for refund." });
+    }
+
+    let settlement = await escrowSettlementsCollection.findOne({ bookingId: booking._id });
+    if (settlement && settlement.action !== "refund") {
+      return res.status(409).send({ message: "A different escrow settlement already exists." });
+    }
+
+    let shouldSubmitRefund = false;
+    if (!settlement && (!booking.bankTranId || !SSLCZ_STORE_PASSWD)) {
+      return res.status(503).send({
+        message: "Refund cannot be submitted: bank transaction ID or gateway credentials are missing.",
+      });
+    }
+
+    if (!settlement) {
+      const session = client.startSession();
+      const settlementId = new ObjectId();
+      const refundReference = `TTER${booking._id.toString()}`;
+      try {
+        await session.withTransaction(async () => {
+          const currentDispute = await disputesCollection.findOne(
+            { _id: disputeId, status: "open" },
+            { session }
+          );
+          if (!currentDispute) {
+            throw Object.assign(new Error("Dispute is not open."), { code: "DISPUTE_NOT_OPEN" });
+          }
+
+          const changed = await bookingsCollection.updateOne(
+            { _id: booking._id, escrowStatus: "frozen" },
+            { $set: { escrowStatus: "refund_processing", updatedAt: now } },
+            { session }
+          );
+          if (changed.modifiedCount !== 1) {
+            throw Object.assign(new Error("Escrow is not frozen."), { code: "ESCROW_NOT_FROZEN" });
+          }
+
+          const disputeUpdate = await disputesCollection.updateOne(
+            { _id: disputeId, status: "open" },
+            { $set: { status: "refund_processing", updatedAt: now } },
+            { session }
+          );
+          if (disputeUpdate.modifiedCount !== 1) {
+            throw Object.assign(new Error("Dispute state changed during refund reservation."), {
+              code: "DISPUTE_NOT_OPEN",
+            });
+          }
+          await escrowSettlementsCollection.insertOne(
+            {
+              _id: settlementId,
+              bookingId: booking._id,
+              disputeId,
+              action: "refund",
+              status: "submitting",
+              amount: Number(booking.amount),
+              refundReference,
+              createdAt: now,
+              updatedAt: now,
+            },
+            { session }
+          );
+        });
+        settlement = await escrowSettlementsCollection.findOne({ _id: settlementId });
+        booking.escrowStatus = "refund_processing";
+        shouldSubmitRefund = true;
+      } catch (err) {
+        if (["DISPUTE_NOT_OPEN", "ESCROW_NOT_FROZEN", 11000].includes(err.code)) {
+          return res.status(409).send({ message: "A settlement is already being processed." });
+        }
+        console.error("Refund reservation error:", err);
+        return res.status(500).send({ message: "Failed to reserve refund settlement." });
+      } finally {
+        await session.endSession();
+      }
+    }
+
+    if (settlement.status === "submitting" && shouldSubmitRefund) {
+      try {
+        const refundResponse = await callSslczRefundApi({
+          bank_tran_id: booking.bankTranId,
+          refund_amount: Number(booking.amount).toFixed(2),
+          refund_remarks: `Dispute refund ${booking._id}`,
+          refe_id: settlement.refundReference,
+        });
+        const refundRefId = refundResponse.refund_ref_id;
+        if (
+          String(refundResponse.status || "").toLowerCase() !== "success" ||
+          !refundRefId
+        ) {
+          await escrowSettlementsCollection.updateOne(
+            { _id: settlement._id, status: "submitting" },
+            {
+              $set: {
+                status: "submission_unknown",
+                providerResponse: refundResponse,
+                updatedAt: new Date(),
+              },
+            }
+          );
+          return res.status(502).send({
+            message: "Refund submission could not be confirmed. Reconcile with SSLCOMMERZ before retrying.",
+          });
+        }
+
+        await escrowSettlementsCollection.updateOne(
+          { _id: settlement._id, status: "submitting" },
+          {
+            $set: {
+              status: "processing",
+              refundRefId,
+              providerResponse: refundResponse,
+              updatedAt: new Date(),
+            },
+          }
+        );
+        settlement.status = "processing";
+        settlement.refundRefId = refundRefId;
+      } catch (err) {
+        await escrowSettlementsCollection.updateOne(
+          { _id: settlement._id, status: "submitting" },
+          { $set: { status: "submission_unknown", updatedAt: new Date() } }
+        );
+        console.error("SSLCOMMERZ refund submission error:", err);
+        return res.status(502).send({
+          message: "Refund submission outcome is unknown. Reconcile with SSLCOMMERZ before retrying.",
+        });
+      }
+    }
+
+    if (settlement.status === "submitting") {
+      return res.status(202).send({
+        message: "Refund submission is reserved or has an unknown outcome; do not retry the gateway request.",
+      });
+    }
+
+    if (settlement.status === "processing") {
+      if (!SSLCZ_STORE_PASSWD) {
+        return res.status(503).send({ message: "SSLCZ_STORE_PASSWD is not configured." });
+      }
+      try {
+        const refundStatus = await callSslczRefundApi({
+          refund_ref_id: settlement.refundRefId,
+        });
+        const status = String(refundStatus.status || "").toLowerCase();
+
+        if (status === "refunded") {
+          const session = client.startSession();
+          try {
+            await session.withTransaction(async () => {
+              const changed = await bookingsCollection.updateOne(
+                { _id: booking._id, escrowStatus: "refund_processing" },
+                { $set: { escrowStatus: "refunded", refundedAt: new Date(), updatedAt: new Date() } },
+                { session }
+              );
+              if (changed.modifiedCount !== 1) {
+                throw Object.assign(new Error("Refund was already settled."), { code: "ALREADY_SETTLED" });
+              }
+
+              const disputeUpdate = await disputesCollection.updateOne(
+                { _id: disputeId, status: "refund_processing" },
+                {
+                  $set: {
+                    status: "resolved",
+                    resolution: "refund",
+                    resolvedAt: new Date(),
+                    updatedAt: new Date(),
+                  },
+                },
+                { session }
+              );
+              if (disputeUpdate.modifiedCount !== 1) {
+                throw Object.assign(new Error("Dispute state changed during refund settlement."), {
+                  code: "ALREADY_SETTLED",
+                });
+              }
+              const settlementUpdate = await escrowSettlementsCollection.updateOne(
+                { _id: settlement._id, status: "processing" },
+                { $set: { status: "completed", completedAt: new Date(), providerStatus: refundStatus, updatedAt: new Date() } },
+                { session }
+              );
+              if (settlementUpdate.modifiedCount !== 1) {
+                throw Object.assign(new Error("Settlement state changed during refund settlement."), {
+                  code: "ALREADY_SETTLED",
+                });
+              }
+              await auditLogsCollection.insertOne(
+                {
+                  action: "ESCROW_REFUNDED",
+                  adminId: req.user._id,
+                  adminEmail: req.user.email,
+                  targetBookingId: booking._id,
+                  targetDisputeId: disputeId,
+                  details: {
+                    gateway: "sslcommerz",
+                    refundRefId: settlement.refundRefId,
+                    amount: Number(booking.amount),
+                  },
+                  createdAt: new Date(),
+                },
+                { session }
+              );
+            });
+            return res.send({ message: "SSLCOMMERZ refund completed and dispute resolved." });
+          } catch (err) {
+            if (err.code === "ALREADY_SETTLED") {
+              const currentBooking = await bookingsCollection.findOne({ _id: booking._id });
+              if (currentBooking?.escrowStatus === "refunded") {
+                return res.send({ message: "Refund was already settled." });
+              }
+              return res.status(409).send({ message: "Refund settlement state changed concurrently." });
+            }
+            throw err;
+          } finally {
+            await session.endSession();
+          }
+        }
+
+        if (status === "cancelled") {
+          const session = client.startSession();
+          try {
+            await session.withTransaction(async () => {
+              const settlementUpdate = await escrowSettlementsCollection.updateOne(
+                { _id: settlement._id, status: "processing" },
+                { $set: { status: "cancelled", providerStatus: refundStatus, updatedAt: new Date() } },
+                { session }
+              );
+              const bookingUpdate = await bookingsCollection.updateOne(
+                { _id: booking._id, escrowStatus: "refund_processing" },
+                { $set: { escrowStatus: "frozen", updatedAt: new Date() } },
+                { session }
+              );
+              const disputeUpdate = await disputesCollection.updateOne(
+                { _id: disputeId, status: "refund_processing" },
+                { $set: { status: "open", updatedAt: new Date() } },
+                { session }
+              );
+              if (
+                settlementUpdate.modifiedCount !== 1 ||
+                bookingUpdate.modifiedCount !== 1 ||
+                disputeUpdate.modifiedCount !== 1
+              ) {
+                throw new Error("Refund cancellation state changed concurrently.");
+              }
+            });
+          } finally {
+            await session.endSession();
+          }
+          return res.status(409).send({ message: "SSLCOMMERZ cancelled the refund; dispute remains open." });
+        }
+
+        return res.status(202).send({
+          message: "Refund is still processing with SSLCOMMERZ.",
+          refundStatus: status || "unknown",
+        });
+      } catch (err) {
+        console.error("SSLCOMMERZ refund status error:", err);
+        return res.status(502).send({ message: "Failed to query SSLCOMMERZ refund status." });
+      }
+    }
+
+    return res.status(409).send({
+      message: `Refund is in state "${settlement.status}" and requires gateway reconciliation.`,
+    });
+  }
+);
 // ==========================================
 // 11. START LOCAL SERVER
 // ==========================================
