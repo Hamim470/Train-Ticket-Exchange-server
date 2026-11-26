@@ -1169,7 +1169,7 @@ app.get("/api/tickets", async (req, res) => {
       message: "Failed to load available tickets.",
     });
   }
-})
+});
 
 
 // ==========================================
@@ -1214,12 +1214,19 @@ app.post("/api/tickets/:id/lock", requireAuth, async (req, res) => {
     const lockedResult = await ticketsCollection.findOneAndUpdate(
       {
         _id: ticketObjectId,
+        sellerId: { $ne: currentUserId },
+        status: { $ne: "sold" },
         $or: [
           { status: "available" },
           {
             status: "locked",
             lockedUntil: { $lt: now },
-            $or: [{ activePaymentId: { $exists: false } }, { activePaymentId: null }],
+            activePaymentId: { $in: [null, undefined] },
+          },
+          {
+            status: "locked",
+            lockedBy: currentUserId,
+            activePaymentId: { $in: [null, undefined] },
           },
         ],
       },
@@ -1236,10 +1243,12 @@ app.post("/api/tickets/:id/lock", requireAuth, async (req, res) => {
         returnDocument: "after",
         projection: {
           seatNumber: 0,
+          coach: 0,
           pnr: 0,
           ticketFileUrl: 0,
           sellerPhone: 0,
           phone: 0,
+          sellerEmail: 0,
         },
       }
     );
@@ -2219,6 +2228,11 @@ app.patch(
       return res.status(400).send({ message: "Action must be 'release' or 'refund'." });
     }
 
+    const adminNote = typeof req.body.adminNote === "string" ? req.body.adminNote.trim() : "";
+    if (adminNote.length > 2000) {
+      return res.status(400).send({ message: "Admin note must be 2000 characters or fewer." });
+    }
+
     const disputeId = new ObjectId(req.params.id);
     const now = new Date();
 
@@ -2255,7 +2269,16 @@ app.patch(
 
           const disputeUpdate = await disputesCollection.updateOne(
             { _id: disputeId, status: "open" },
-            { $set: { status: "resolved", resolution: "release", resolvedAt: now, updatedAt: now } },
+            {
+              $set: {
+                status: "resolved",
+                resolution: "release",
+                adminNote,
+                resolvedBy: req.user._id,
+                resolvedAt: now,
+                updatedAt: now,
+              },
+            },
             { session }
           );
           if (disputeUpdate.modifiedCount !== 1) {
@@ -2316,7 +2339,11 @@ app.patch(
               adminEmail: req.user.email,
               targetBookingId: booking._id,
               targetDisputeId: disputeId,
-              details: { settlement: "seller_wallet", amount: Number(booking.fare) },
+              details: {
+                settlement: "seller_wallet",
+                amount: Number(booking.fare),
+                adminNote,
+              },
               createdAt: now,
             },
             { session }
@@ -2384,7 +2411,14 @@ app.patch(
 
           const disputeUpdate = await disputesCollection.updateOne(
             { _id: disputeId, status: "open" },
-            { $set: { status: "refund_processing", updatedAt: now } },
+            {
+              $set: {
+                status: "refund_processing",
+                adminNote,
+                resolvedBy: req.user._id,
+                updatedAt: now,
+              },
+            },
             { session }
           );
           if (disputeUpdate.modifiedCount !== 1) {
@@ -2403,6 +2437,22 @@ app.patch(
               refundReference,
               createdAt: now,
               updatedAt: now,
+            },
+            { session }
+          );
+          await auditLogsCollection.insertOne(
+            {
+              action: "ESCROW_REFUND_REQUESTED",
+              adminId: req.user._id,
+              adminEmail: req.user.email,
+              targetBookingId: booking._id,
+              targetDisputeId: disputeId,
+              details: {
+                gateway: "sslcommerz",
+                amount: Number(booking.amount),
+                adminNote,
+              },
+              createdAt: now,
             },
             { session }
           );
@@ -2541,6 +2591,7 @@ app.patch(
                     gateway: "sslcommerz",
                     refundRefId: settlement.refundRefId,
                     amount: Number(booking.amount),
+                    adminNote,
                   },
                   createdAt: new Date(),
                 },
